@@ -1,0 +1,196 @@
+---
+- name: Init variables
+  set_fact:
+    nd_hostnames: "{{ NDHostname.split(',') | map('trim') | reject('equalto','') | list }}"
+    rt_status: "failed"
+    rt_worknotes: []
+    timestamp_cmd: "date +'%Y-%m-%d %H:%M:%S'"
+    any_connected: false
+    any_parsed: false
+    down_values:
+      - "down"
+      - "notconnect"
+      - "not connected"
+      - "inactive"
+      - "failed"
+
+# Banner
+- name: Log processing/correlation info (banner)
+  set_fact:
+    rt_worknotes: "{{ rt_worknotes + [ '[' ~ lookup('pipe', timestamp_cmd) ~ '] INFORMATION - ' ~ (ProcessingInfo | trim) ] }}"
+  when: ProcessingInfo is defined and (ProcessingInfo | trim) | length > 0
+
+# Per device
+- name: Process each device for stack port info
+  block:
+
+    - name: Check SSH TCP connectivity
+      ansible.builtin.wait_for:
+        host: "{{ item }}"
+        port: 22
+        timeout: 6
+      register: ssh_check
+      ignore_errors: true
+
+    - name: Log SSH connectivity (Write-Log equivalent)
+      vars:
+        reachable: "{{ not ssh_check.failed }}"
+        msg: >-
+          {{ 'Network device ' ~ item ~ ' connected successfully.'
+             if reachable else
+             'Network device ' ~ item ~ ' is not connected.' }}
+        level: "{{ 'success' if reachable else 'failed' }}"
+      set_fact:
+        rt_worknotes: "{{ rt_worknotes + [ '[' ~ lookup('pipe', timestamp_cmd) ~ '] ' ~ level | upper ~ ' - ' ~ msg ] }}"
+        any_connected: "{{ any_connected or reachable }}"
+        rt_status: "{{ level }}"
+
+    - name: Skip CLI commands when SSH unreachable
+      when: ssh_check.failed
+      debug:
+        msg: "Skipping CLI for {{ item }} as SSH is unreachable"
+
+    - name: Run stackwise commands (detail, base, ports summary)
+      vars:
+        ansible_connection: network_cli
+        ansible_network_os: "{{ network_os | default('cisco.ios.ios') }}"
+        ansible_host: "{{ item }}"
+        ansible_user: "{{ NDUsername }}"
+        ansible_password: "{{ NDPassword }}"
+        ansible_ssh_common_args: "-o StrictHostKeyChecking=no"
+      cisco.ios.ios_command:
+        commands:
+          - show switch detail
+          - show switch
+          - show switch stack-ports summary
+      register: sw_cmd
+      when: not ssh_check.failed
+      ignore_errors: true
+      no_log: true
+
+    - name: Extract raw outputs
+      set_fact:
+        sw_detail: "{{ sw_cmd.stdout[0] | default('') }}"
+        sw_base:   "{{ sw_cmd.stdout[1] | default('') }}"
+        sw_ports:  "{{ sw_cmd.stdout[2] | default('') }}"
+      when: not ssh_check.failed
+
+    - name: Regex parse for stack members (from 'show switch detail')
+      set_fact:
+        stack_matches: >-
+          {{
+            (sw_detail | default(''))
+            | regex_findall(
+                '(?is)Switch\\s+(\\d+).*?Role\\s*:\\s*(\\S+).*?MAC\\s*address\\s*:\\s*([0-9A-Fa-f:\\.-]+).*?Priority\\s*:\\s*(\\d+).*?State\\s*:\\s*(\\S+).*?Stack\\s*Port\\s*1\\s*Status\\s*:\\s*([A-Za-z ]+).*?Stack\\s*Port\\s*2\\s*Status\\s*:\\s*([A-Za-z ]+)',
+                multiline=True
+              )
+          }}
+      when: not ssh_check.failed
+
+    - name: Initialize per-device facts
+      set_fact:
+        stack_members: []
+        down_port_count: 0
+        ready_kw_count: "{{ (sw_detail | upper | regex_findall('\\bREADY\\b') | length) | int }}"
+        down_kw_count:  "{{ (sw_detail | upper | regex_findall('\\bDOWN\\b')  | length) | int }}"
+      when: not ssh_check.failed
+
+    - name: Build stack_members list from regex matches
+      set_fact:
+        stack_members: "{{ stack_members + [ {
+          'device': item,
+          'switch': (it.0 | int),
+          'role': it.1,
+          'mac': it.2,
+          'priority': (it.3 | int),
+          'state': it.4,
+          'port1_status': (it.5 | trim),
+          'port2_status': (it.6 | trim)
+        } ] }}"
+      loop: "{{ stack_matches | default([]) }}"
+      loop_control:
+        loop_var: it
+      when: not ssh_check.failed
+
+    - name: Count ports that are down/notconnected/failed
+      set_fact:
+        down_port_count: >-
+          {{
+            down_port_count
+            + (
+                ((itm.port1_status | lower) in down_values) | ternary(1,0)
+              )
+            + (
+                ((itm.port2_status | lower) in down_values) | ternary(1,0)
+              )
+          }}
+      loop: "{{ stack_members | default([]) }}"
+      loop_control:
+        loop_var: itm
+      when: not ssh_check.failed
+
+    - name: Decide if we parsed anything meaningful
+      set_fact:
+        parsed_this_device: "{{ (stack_members | length) > 0 or (ready_kw_count + down_kw_count) > 0 }}"
+        any_parsed:        "{{ any_parsed or ((stack_members | length) > 0 or (ready_kw_count + down_kw_count) > 0) }}"
+      when: not ssh_check.failed
+
+    - name: Construct per-member report lines and append to worknotes
+      set_fact:
+        rt_worknotes: "{{ rt_worknotes + [ '[' ~ lookup('pipe', timestamp_cmd) ~ '] INFORMATION - ' ~ report_line ] }}"
+      vars:
+        report_line: >-
+          {{
+            'Device=' ~ item ~
+            ' | Switch=' ~ (m.switch | string) ~
+            ' Role=' ~ m.role ~
+            ' State=' ~ m.state ~
+            ' Port1=' ~ m.port1_status ~
+            ' Port2=' ~ m.port2_status
+          }}
+      loop: "{{ stack_members | default([]) }}"
+      loop_control:
+        loop_var: m
+      when:
+        - not ssh_check.failed
+        - (stack_members | length) > 0
+
+    - name: Append summary counters to worknotes
+      set_fact:
+        rt_worknotes: "{{ rt_worknotes + [
+          '[' ~ lookup('pipe', timestamp_cmd) ~ '] INFORMATION - ' ~
+          'Device=' ~ item ~ ' | READY_keywords=' ~ (ready_kw_count | string) ~ ' DOWN_keywords=' ~ (down_kw_count | string) ~
+          ' DownPorts=' ~ (down_port_count | string)
+        ] }}"
+      when: not ssh_check.failed
+
+    - name: Aggregate per-device results
+      set_fact:
+        per_device_stack: "{{ (per_device_stack | default({})) | combine({
+          item: {
+            'stack_members': stack_members,
+            'ready_kw_count': ready_kw_count,
+            'down_kw_count': down_kw_count,
+            'down_port_count': down_port_count,
+            'parsed': parsed_this_device
+          }
+        }) }}"
+      when: not ssh_check.failed
+
+  loop: "{{ nd_hostnames }}"
+  loop_control:
+    label: "{{ item }}"
+
+# Final overall status
+- name: Finalize RT status
+  set_fact:
+    rt_status: "{{ 'success' if (any_connected or any_parsed) else 'failed' }}"
+    any_down_overall: >-
+      {{
+        (per_device_stack | default({}))
+        | dict2items
+        | map(attribute='value.down_port_count')
+        | list
+        | sum
+        | int > 0
+      }}
