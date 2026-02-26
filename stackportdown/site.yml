@@ -1,0 +1,22 @@
+---
+- name: Hostname → IP Resolver (Equivalent of PowerShell Logic)
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - vars.yml
+
+  roles:
+    - resolve_ips
+
+  # Optional: show the outputs (so you can verify behavior)
+  tasks:
+    - debug:
+        var: summary_hostname
+    - debug:
+        var: hostnames_worknotes
+    - debug:
+        var: ndhostname
+    - debug:
+        var: rtstatus
+    - debug:
+        var: processing_log
