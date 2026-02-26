@@ -1,0 +1,14 @@
+summary: |
+  `d.T.~Ed/{C5A55074-DDE3-4895-AF3C-F0782471FDBA}.{91B88D53-AB43-431E-BB3B-DAF736A01EAB}`d.T.~Ed/
+
+worknotes: |
+  Correlated alerts:
+  HOSTA: some text
+  HOSTB: other text
+  HOSTC: etc
+  HOSTD: etc
+  HOSTE: etc
+
+ipaddress: ""  # leave empty to force resolution of summary hostname; set to a value to use it directly
+
+fqdn: "hosta.example.com"  # set your real FQDN if you want fqdn-based resolution when it contains the hostname
