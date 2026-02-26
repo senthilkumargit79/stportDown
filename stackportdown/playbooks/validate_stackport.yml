@@ -1,0 +1,16 @@
+---
+- name: Validate Stack-Port Properties 
+  hosts: localhost
+  gather_facts: false
+
+  roles:
+    - validate_stackport
+
+  # Outputs equivalent to $RTStatus, $RTWorkNotes, $RTPortStatus
+  tasks:
+    - debug:
+        var: rt_status
+    - debug:
+        var: rt_port_status
+    - debug:
+        msg: "{{ rt_worknotes | default([]) | join('\n') }}"
