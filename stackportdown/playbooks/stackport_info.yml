@@ -1,0 +1,20 @@
+---
+- name: Get Stack Port Info Properties (Converted from PowerShell)
+  hosts: localhost
+  gather_facts: false
+
+  roles:
+    - stackport_info
+
+  # Optionally show outputs
+  tasks:
+    - debug:
+        var: rt_status
+    - debug:
+        var: any_connected
+    - debug:
+        var: any_parsed
+    - debug:
+        var: per_device_stack
+    - debug:
+        msg: "{{ rt_worknotes | default([]) | join('\n') }}"
