@@ -1,0 +1,229 @@
+---
+- name: Init variables
+  set_fact:
+    nd_hostnames: "{{ NDHostname.split(',') | map('trim') | reject('equalto','') | list }}"
+    device_count: "{{ NDHostname.split(',') | map('trim') | reject('equalto','') | list | length }}"
+    rt_status: "failed"
+    rt_port_status: "Not Ready"
+    rt_worknotes: []
+    any_connected: false
+    any_parsed: false
+    timestamp_cmd: "date +'%Y-%m-%d %H:%M:%S'"
+
+# Banner
+- name: Log processing/correlation info (banner)
+  set_fact:
+    rt_worknotes: "{{ rt_worknotes + [ '[' ~ lookup('pipe', timestamp_cmd) ~ '] INFORMATION - ' ~ (ProcessingInfo | trim) ] }}"
+  when: ProcessingInfo is defined and (ProcessingInfo | trim) | length > 0
+
+# Per-device validation
+- name: Process each device
+  block:
+
+    - name: Reset per-device vars
+      set_fact:
+        stack_members: []
+        this_device_parsed: false
+        this_device_all_ready: false
+
+    - name: Check SSH TCP connectivity
+      ansible.builtin.wait_for:
+        host: "{{ item }}"
+        port: "{{ ssh_port | default(22) }}"
+        timeout: "{{ ssh_timeout | default(6) }}"
+      register: ssh_check
+      ignore_errors: true
+
+    - name: Log SSH connectivity
+      vars:
+        reachable: "{{ not ssh_check.failed }}"
+        msg: >-
+          {{ 'Network device ' ~ item ~ ' connected successfully.'
+             if reachable else
+             'Network device ' ~ item ~ ' is not connected.' }}
+        level: "{{ 'success' if reachable else 'failed' }}"
+      set_fact:
+        rt_worknotes: "{{ rt_worknotes + [ '[' ~ lookup('pipe', timestamp_cmd) ~ '] ' ~ level | upper ~ ' - ' ~ msg ] }}"
+        any_connected: "{{ any_connected or reachable }}"
+        rt_status: "{{ level }}"
+
+    - name: Skip CLI when SSH unreachable
+      when: ssh_check.failed
+      debug:
+        msg: "Skipping CLI for {{ item }} as SSH is unreachable"
+
+    - name: Run stackwise commands (detail + stack-ports)
+      vars:
+        ansible_connection: network_cli
+        ansible_network_os: "{{ network_os | default('cisco.ios.ios') }}"
+        ansible_host: "{{ item }}"
+        ansible_user: "{{ NDUsername }}"
+        ansible_password: "{{ NDPassword }}"
+        ansible_ssh_common_args: "-o StrictHostKeyChecking=no"
+      cisco.ios.ios_command:
+        commands:
+          - show switch detail
+          - show switch stack-ports
+      register: sw_cmd
+      when: not ssh_check.failed
+      ignore_errors: true
+      no_log: true
+
+    - name: Extract raw outputs
+      set_fact:
+        sw_detail: "{{ sw_cmd.stdout[0] | default('') }}"
+        sw_stackports: "{{ sw_cmd.stdout[1] | default('') }}"
+      when: not ssh_check.failed
+
+    - name: Log sizes of outputs collected (no content dump)
+      set_fact:
+        rt_worknotes: "{{ rt_worknotes + [
+          '[' ~ lookup('pipe', timestamp_cmd) ~ '] INFORMATION - Device=' ~ item ~
+          ' | Collected: show switch detail (' ~ (sw_detail|length|string) ~ ' chars), ' ~
+          'show switch stack-ports (' ~ (sw_stackports|length|string) ~ ' chars)'
+        ] }}"
+      when: not ssh_check.failed
+
+    - name: Parse stack members from 'show switch detail'
+      set_fact:
+        stack_matches: >-
+          {{
+            (sw_detail | default(''))
+            | regex_findall(
+                '(?is)Switch\\s+(\\d+).*?Role\\s*:\\s*(\\S+).*?MAC\\s*address\\s*:\\s*([0-9A-Fa-f:\\.-]+).*?Priority\\s*:\\s*(\\d+).*?State\\s*:\\s*(\\S+).*?Stack\\s*Port\\s*1\\s*Status\\s*:\\s*([A-Za-z ]+).*?Stack\\s*Port\\s*2\\s*Status\\s*:\\s*([A-Za-z ]+)',
+                multiline=True
+              )
+          }}
+      when: not ssh_check.failed
+
+    - name: Build stack_members
+      set_fact:
+        stack_members: "{{ (stack_members | default([])) + [ {
+          'device': item,
+          'switch': (it.0 | int),
+          'role': it.1,
+          'mac': it.2,
+          'priority': (it.3 | int),
+          'state': it.4,
+          'port1_status': (it.5 | trim),
+          'port2_status': (it.6 | trim)
+        } ] }}"
+      loop: "{{ stack_matches | default([]) }}"
+      loop_control:
+        loop_var: it
+      when: not ssh_check.failed
+
+    - name: Evaluate readiness
+      vars:
+        states: "{{ (stack_members | default([])) | map(attribute='state') | list }}"
+        not_ready_states: "{{ states | select('match','^(?i)(?!Ready$).*') | list }}"
+      set_fact:
+        this_device_parsed: "{{ (stack_members | default([])) | length > 0 }}"
+        this_device_all_ready: "{{ (states | length) > 0 and (not_ready_states | length) == 0 }}"
+        any_parsed: "{{ any_parsed or ((stack_members | default([])) | length > 0) }}"
+      when: not ssh_check.failed
+
+    - name: Log per-member READY/NOT READY
+      set_fact:
+        rt_worknotes: "{{ rt_worknotes + [ '[' ~ lookup('pipe', timestamp_cmd) ~ '] ' ~
+          ( (m.state | lower == 'ready') | ternary('SUCCESS','FAILED') ) ~
+          ' - Device=' ~ item ~
+          ' | Switch=' ~ (m.switch | string) ~
+          ' State=' ~ m.state ~
+          ' Port1=' ~ m.port1_status ~
+          ' Port2=' ~ m.port2_status
+        ] }}"
+      loop: "{{ stack_members | default([]) }}"
+      loop_control:
+        loop_var: m
+      when:
+        - not ssh_check.failed
+        - (stack_members | default([]) | length) > 0
+
+    - name: Log device-level summary
+      set_fact:
+        rt_worknotes: "{{ rt_worknotes + [
+          '[' ~ lookup('pipe', timestamp_cmd) ~ '] ' ~
+          ( this_device_all_ready | ternary('SUCCESS','FAILED') ) ~
+          ' - Device=' ~ item ~
+          ( this_device_all_ready | ternary(' | All switches in Ready state',
+                                            ' | One or more switches are NOT in Ready state') )
+        ] }}"
+      when:
+        - not ssh_check.failed
+        - this_device_parsed is defined
+
+    - name: Aggregate per-device result
+      set_fact:
+        per_device_stack: "{{ (per_device_stack | default({})) | combine({
+          item: {
+            'parsed': this_device_parsed | default(false),
+            'all_ready': this_device_all_ready | default(false),
+            'members': stack_members | default([])
+          }
+        }) }}"
+      when: not ssh_check.failed
+
+  loop: "{{ nd_hostnames }}"
+  loop_control:
+    label: "{{ item }}"
+
+# Log extra correlation notes (if provided)
+- name: Log remaining correlation alerts (if provided)
+  set_fact:
+    rt_worknotes: "{{ rt_worknotes + [
+      '[' ~ lookup('pipe', timestamp_cmd) ~ '] INFORMATION - Hi Team these are the remaining Correlation alerts please do check manually:',
+      (remainingLines | trim)
+    ] }}"
+  when: remainingLines is defined and (remainingLines | trim) | length > 0
+
+# Final RTPortStatus logic
+- name: Decide RTPortStatus
+  block:
+
+    - name: If GlobalIncidentStatus present → Correlation
+      set_fact:
+        rt_port_status: "Correlation"
+        rt_worknotes: "{{ rt_worknotes + [ '[' ~ lookup('pipe', timestamp_cmd) ~ '] SUCCESS - More than one device processed. Setting to ''Correlation'' and transferring the incident.' ] }}"
+      when: GlobalIncidentStatus is defined and (GlobalIncidentStatus | trim) | length > 0
+
+    - name: If exactly one device → Ready/Not Ready based on parsed results
+      when:
+        - not (GlobalIncidentStatus is defined and (GlobalIncidentStatus | trim) | length > 0)
+        - device_count == 1
+      block:
+        - name: Derive single-device readiness
+          set_fact:
+            only_device: "{{ nd_hostnames[0] }}"
+            only_device_connected: "{{ any_connected }}"
+            only_device_ready: >-
+              {{
+                (per_device_stack | default({})).get(nd_hostnames[0], {}).get('all_ready', false)
+              }}
+
+        - name: Set RTPortStatus for the single device and log
+          set_fact:
+            rt_port_status: >-
+              {{
+                (only_device_connected | ternary(
+                  (only_device_ready | ternary('Ready', 'Not Ready')),
+                  'Not Ready'
+                ))
+              }}
+            rt_worknotes: "{{ rt_worknotes + [
+              '[' ~ lookup('pipe', timestamp_cmd) ~ '] ' ~
+              ( (only_device_connected and only_device_ready) | ternary(
+                  'SUCCESS - All switches are in Ready state. Closing the ticket.',
+                  ( only_device_connected
+                    | ternary('FAILED - One or more switches are NOT in Ready state. Transferring the ticket.',
+                              'FAILED - Could not connect to device to check switch status.')
+                  )
+                )
+              )
+            ] }}"
+
+# Overall connectivity summary + final rt_status
+- name: Log overall connection status and finalize RTStatus
+  set_fact:
+    rt_worknotes: "{{ rt_worknotes + [ '[' ~ lookup('pipe', timestamp_cmd) ~ '] ' ~ (any_connected | ternary('SUCCESS - network device connected successfully.','FAILED - All network devices failed to connect.')) ] }}"
+    rt_status: "{{ 'success' if any_connected else 'failed' }}"
