@@ -1,0 +1,16 @@
+---
+- name: Network Device Connectivity Check
+  hosts: localhost
+  gather_facts: false
+
+  roles:
+    - device_connectivity
+
+  # Optionally show outputs
+  tasks:
+    - debug:
+        var: rt_status
+    - debug:
+        var: any_connected
+    - debug:
+        var: rt_worknotes
