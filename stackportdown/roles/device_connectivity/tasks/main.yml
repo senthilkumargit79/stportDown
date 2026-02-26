@@ -1,0 +1,38 @@
+---
+- name: Prepare variables
+  set_fact:
+    ndhostname_list: "{{ NDHostname.split(',') | map('trim') | reject('equalto','') | list }}"
+    ndusername: "{{ NDUsername }}"
+    ndpassword: "{{ NDPassword }}"
+    log: []
+    any_connected: false
+    rt_status: "failed"
+
+# Loop devices and check SSH port 22
+- name: Process each device
+  block:
+
+    - name: Check SSH TCP connectivity (port 22)
+      ansible.builtin.wait_for:
+        host: "{{ item }}"
+        port: 22
+        timeout: 5
+      register: ssh_check
+      ignore_errors: true
+
+    - name: Log connectivity result
+      set_fact:
+        log: "{{ log + [ lookup('pipe','date +\"%Y-%m-%d %H:%M:%S\"') ~
+                 ' - ' ~ (ssh_check.failed | ternary('FAILED','SUCCESS')) ~
+                 ' - Device ' ~ item ~ ' SSH connectivity check' ] }}"
+        any_connected: "{{ any_connected or (not ssh_check.failed) }}"
+
+  loop: "{{ ndhostname_list }}"
+  loop_control:
+    label: "{{ item }}"
+
+# Final status + joined worknotes
+- name: Set final status based on connectivity
+  set_fact:
+    rt_status: "{{ 'success' if any_connected else 'failed' }}"
+    rt_worknotes: "{{ log | join('\n') }}"
