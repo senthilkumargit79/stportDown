@@ -1,0 +1,123 @@
+---
+# Normalize inputs
+- name: Normalize worknotes into array
+  set_fact:
+    worknotes_list: >-
+      {{ (worknotes.split('\n') | map('trim') | list)
+         if worknotes is string else (worknotes | map('trim') | list) }}
+
+- name: Normalize summary into array
+  set_fact:
+    summary_list: >-
+      {{ (summary.split('\n') | map('trim') | list)
+         if summary is string else (summary | map('trim') | list) }}
+
+# Extract summary hostname
+- name: Extract summary hostname lines
+  set_fact:
+    summary_hostname_candidates: "{{ summary_list | select('match', '^\\S+\\s*:') | list }}"
+- name: Set summary hostname
+  set_fact:
+    summary_hostname: "{{ (summary_hostname_candidates[0] | regex_search('^(\\S+)\\s*:', '\\1')) if (summary_hostname_candidates|length>0) else '' }}"
+
+# Extract hostnames from worknotes after 'Correlated alerts:'
+- name: Find correlated alerts index
+  set_fact:
+    correlated_index: "{{ worknotes_list.index('Correlated alerts:') }}"
+  when: "'Correlated alerts:' in worknotes_list"
+
+- name: Next 5 lines after correlated alerts
+  set_fact:
+    correlated_lines: "{{ worknotes_list[correlated_index+1 : correlated_index+6] }}"
+  when: correlated_index is defined
+
+- name: Extract hostnames from correlated lines
+  set_fact:
+    hostnames_worknotes: >-
+      {{
+        (correlated_lines | default([]))
+        | select('match', '^\\S+\\s*:')
+        | map('regex_search', '^(\\S+)\\s*:', '\\1')
+        | list
+      }}
+
+# Initialize outputs
+- name: Init resolver results
+  set_fact:
+    ndhostname: []
+    processing_log: []
+    rtstatus: "failed"
+
+# If ipaddress provided, use it as summary_ip
+- name: Use provided IP address (if any)
+  set_fact:
+    summary_ip: "{{ ipaddress }}"
+    ndhostname: "{{ ndhostname + [ ipaddress ] }}"
+    processing_log: "{{ processing_log + [ 'Summary IP added: ' ~ ipaddress ] }}"
+  when: ipaddress is defined and (ipaddress | trim) | length > 0
+
+# Else resolve summary hostname
+- name: Resolve summary hostname when IP missing
+  block:
+    - name: Resolve summary via FQDN when fqdn contains summary_hostname
+      command: "dig +short {{ fqdn }}"
+      register: dns_out
+      changed_when: false
+      when: fqdn is defined and (fqdn | trim) | length > 0 and fqdn is search(summary_hostname)
+
+    - name: Resolve summary via hostname
+      command: "dig +short {{ summary_hostname }}"
+      register: dns_out
+      changed_when: false
+      when: (summary_hostname | trim) | length > 0 and not (fqdn is defined and fqdn is search(summary_hostname))
+
+    - name: Add resolved summary IP (if any)
+      set_fact:
+        summary_ip: "{{ dns_out.stdout | trim }}"
+        ndhostname: "{{ ndhostname + [ summary_ip ] }}"
+        processing_log: "{{ processing_log + [ 'Resolved summary hostname to IP: ' ~ (dns_out.stdout | trim) ] }}"
+      when: (dns_out.stdout | trim) | length > 0
+  when: summary_ip is not defined
+
+# Resolve worknotes hostnames (max 6 IPs total)
+- name: Resolve worknotes hostnames
+  block:
+    - name: Reuse summary IP if hostname matches summary
+      set_fact:
+        ndhostname: "{{ ndhostname + [ summary_ip ] }}"
+        processing_log: "{{ processing_log + [ 'Matched hostname ' ~ host ~ ' with summary. Added summary IP.' ] }}"
+      when: host == summary_hostname and (summary_ip | default('')) | length > 0
+
+    - name: Resolve via FQDN when fqdn contains host
+      command: "dig +short {{ fqdn }}"
+      register: dn1
+      changed_when: false
+      when: host != summary_hostname and fqdn is defined and (fqdn | trim) | length > 0 and fqdn is search(host)
+
+    - name: Resolve via plain hostname
+      command: "dig +short {{ host }}"
+      register: dn2
+      changed_when: false
+      when: host != summary_hostname and (not (fqdn is defined and (fqdn | trim) | length > 0 and fqdn is search(host)))
+
+    - name: Add resolved host IP
+      set_fact:
+        resolved_host_ip: "{{ (dn1.stdout | default(dn2.stdout)) | trim }}"
+        ndhostname: "{{ ndhostname + [ resolved_host_ip ] }}"
+        processing_log: "{{ processing_log + [ 'Resolved IP for ' ~ host ~ ': ' ~ resolved_host_ip ] }}"
+      when: ((dn1.stdout | default(dn2.stdout)) | trim) | length > 0
+
+  loop: "{{ hostnames_worknotes | default([]) }}"
+  loop_control:
+    loop_var: host
+  when: (ndhostname | length) < 6
+
+# Cap to 6 IPs
+- name: Cap ndhostname to 6 entries
+  set_fact:
+    ndhostname: "{{ ndhostname[:6] }}"
+
+# Final status
+- name: Set final resolver status
+  set_fact:
+    rtstatus: "{{ 'success' if (ndhostname | length) > 0 else 'failed' }}"
