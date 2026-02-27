@@ -1,5 +1,5 @@
 ---
-- name: Hostname → IP Resolver (Equivalent of PowerShell Logic)
+- name: Hostname → IP Resolver 
   hosts: localhost
   gather_facts: false
   vars_files:
