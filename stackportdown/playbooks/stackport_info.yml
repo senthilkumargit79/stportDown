@@ -1,5 +1,5 @@
 ---
-- name: Get Stack Port Info Properties (Converted from PowerShell)
+- name: Get Stack Port Info Properties 
   hosts: localhost
   gather_facts: false
 
